@@ -1,0 +1,202 @@
+# ==========================================================
+# Cell 16 : LINKING + TRAVERSAL  (SPARQL, no LLM)
+#
+#   ITERATED, NOT A PROPERTY PATH: SPARQL property paths require fixed
+#   predicate IRIs -- variables are illegal inside a path -- and the
+#   {n,m} cardinality forms were removed from SPARQL 1.1 before it was
+#   finalised. With distinct predicates per relationship, the options
+#   are a chained-statement query or an iterated 1-hop query. Iterating
+#   wins: rdflib evaluates a chained double-statement pattern as a
+#   near-cartesian join, and each hop multiplies it again.
+#
+#   OUTGOING ONLY (Wikipedia-style): hop 1 = the seed's own outgoing
+#   hyperlinks, hop 2 = those targets' own outgoing hyperlinks, and so
+#   on -- pure forward expansion, never looking backward at who links
+#   TO a node.
+#
+#   CONSEQUENCE OF THIS: Cell 10 only ever writes document -> entity
+#   edges (a document is always rdf:subject, never rdf:object). Under
+#   outgoing-only traversal, a seed that resolves to a pure ENTITY node
+#   (something documents link to, but which itself links to nothing)
+#   has zero outgoing edges and yields nothing at hop 1. That is
+#   expected under this model, not a bug -- a DOCUMENT seed is what
+#   drives expansion, the same way a Wikipedia article's own hyperlinks
+#   are what you follow outward from it.
+# ==========================================================
+print("=" * 80)
+print("CELL 16 — LINKING + TRAVERSAL")
+print("=" * 80)
+
+# ---- SPARQL templates -----------------------------------------------------
+# ?src is bound directly via VALUES instead of a generic ?seed + FILTER --
+# this lets the query engine match rdf:subject straight off the frontier
+# rather than scanning every statement and filtering both sides, and it
+# makes the outgoing-only direction explicit in the query itself.
+NEIGHBOUR_QUERY_TMPL = PREFIXES + """
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    VALUES ?src { %SEEDS% }
+    ?stmt a rdf:Statement ;
+          rdf:subject   ?src ;
+          rdf:predicate ?pred ;
+          rdf:object    ?tgt ;
+          ex:description ?description ;
+          ex:strength    ?strength ;
+          ex:linkType    ?linkType .
+    OPTIONAL { ?src  rdfs:label ?srcLabel }
+    OPTIONAL { ?tgt  rdfs:label ?tgtLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+}
+"""
+
+DOC_CONTENT_TMPL = PREFIXES + """
+SELECT ?doc ?label ?content
+WHERE {
+    VALUES ?doc { %DOCS% }
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label ?label }
+}
+"""
+
+SUBSTRING_TMPL = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE {
+    ?node rdfs:label ?label .
+    FILTER(CONTAINS(LCASE(STR(?label)), %PHRASE%))
+    FILTER(!STRSTARTS(STR(?node), "%PREDMARK%"))
+}
+LIMIT 10
+"""
+
+_STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
+         "are", "what", "which", "how", "does", "do", "with", "by", "from"}
+
+
+def _tokens(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if t not in _STOP and len(t) > 2}
+
+
+def _values_block(uris):
+    return " ".join(f"<{u}>" for u in uris if "<" not in u and ">" not in u)
+
+
+def _sparql_literal(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def link_entities(phrases):
+    """Phrases (list[str]) -> [(node, label, score, phrase)]. Two passes:
+    SPARQL substring for precision, fuzzy for recall. Fuzzy only runs for
+    a phrase when the substring pass found NOTHING for it -- a clean
+    substring hit doesn't also pay for a full fuzzy scan over every label
+    in the graph."""
+    best = {}
+    for phrase in phrases:
+        q = (SUBSTRING_TMPL
+             .replace("%PHRASE%", _sparql_literal(phrase.lower()))
+             .replace("%PREDMARK%", PREDICATE_MARKER))
+        found_substring = False
+        try:
+            for row in g.query(q):
+                node = str(row.node)
+                if best.get(node, (0,))[0] < 95:
+                    best[node] = (95.0, phrase)
+                found_substring = True
+        except Exception as e:
+            print(f"  substring query failed for {phrase!r}: {e}")
+
+        if found_substring:
+            continue
+
+        for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
+                                           MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
+            for node in LABEL_TO_NODES[label_lc]:
+                if node not in best or score > best[node][0]:
+                    best[node] = (score, phrase)
+
+    return [(n, NODE_LABEL.get(n, n), s, p)
+            for n, (s, p) in sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)]
+
+
+def lexical_fallback(question, limit=5):
+    """No LLM, no embeddings. Used when extraction returns nothing or
+    nothing links."""
+    q_tokens = _tokens(question)
+    if not q_tokens:
+        return []
+    scored = []
+    for label_lc, nodes in LABEL_TO_NODES.items():
+        overlap = q_tokens & _tokens(label_lc)
+        if overlap:
+            score = 100.0 * len(overlap) / max(len(_tokens(label_lc)), 1)
+            for n in nodes:
+                scored.append((n, NODE_LABEL.get(n, n), min(score, 99.0), "lexical"))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[:limit]
+
+
+def traverse(seeds):
+    """Outgoing-only SPARQL expansion -- one query per hop, VALUES rebound
+    to that hop's frontier. Hop 1 = each seed's own outgoing edges, hop 2
+    = those targets' own outgoing edges (Wikipedia-style forward-only
+    link following). A seed with no outgoing edges (a pure entity node --
+    see the header note above) simply contributes nothing; that's
+    expected, not a failure."""
+    edges, seen = [], set()
+    visited = {n: (0, s) for n, _l, s, _p in seeds}
+    frontier = [n for n, _l, _s, _p in seeds]
+
+    for hop in range(1, MAX_HOPS + 1):
+        if not frontier or len(edges) >= MAX_EDGES:
+            break
+        block = _values_block(frontier[:MAX_FRONTIER])
+        if not block:
+            break
+        try:
+            rows = list(g.query(NEIGHBOUR_QUERY_TMPL.replace("%SEEDS%", block)))
+        except Exception as e:
+            print(f"  hop {hop} query failed: {e}")
+            break
+
+        next_frontier = []
+        for row in rows:
+            src, tgt = str(row.src), str(row.tgt)
+            pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
+            key = (src, pred, tgt)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # outgoing-only means src is always already-visited (a seed,
+            # or a target discovered at an earlier hop) -- no need to
+            # check both sides the way bidirectional traversal did.
+            seed_score = visited.get(src, (0, 0))[1]
+
+            edges.append({
+                "source": src,
+                "source_label": str(row.srcLabel) if row.srcLabel else NODE_LABEL.get(src, src),
+                "predicate": pred,
+                "target": tgt,
+                "target_label": str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt),
+                "description": str(row.description),
+                "strength": int(row.strength),
+                "link_type": str(row.linkType),
+                "hop": hop,
+                "seed_score": seed_score,
+            })
+
+            if tgt not in visited:
+                visited[tgt] = (hop, seed_score)
+                next_frontier.append(tgt)
+
+            if len(edges) >= MAX_EDGES:
+                break
+        frontier = next_frontier
+
+    return edges, visited
+
+
+print("Defined: link_entities, lexical_fallback, traverse")
+print("Traversal direction: OUTGOING ONLY (Wikipedia-style forward link following)")
