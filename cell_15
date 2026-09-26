@@ -1,0 +1,110 @@
+# ==========================================================
+# Cell 15 : QUERY -> ENTITY PHRASES
+#           The only LLM call before retrieval. Everything downstream
+#           is deterministic graph work.
+#
+#           This does NOT retrieve an answer. It only identifies which
+#           noun phrases in the question should be looked up as nodes
+#           in the knowledge graph. The KG itself does the retrieving,
+#           in Cell 16.
+# ==========================================================
+print("=" * 80)
+print("CELL 15 — QUERY ENTITY EXTRACTION")
+print("=" * 80)
+
+# ---- Config ---------------------------------------------------------------
+MAX_ENTITY_PHRASES = 8             # hard cap -- keeps Cell 16 from fanning out
+                                    # into dozens of SPARQL/fuzzy lookups on a
+                                    # single question
+EXTRACT_MAX_RETRIES = 2            # transient LLM/network hiccups only --
+                                    # a bad/unparseable response is NOT retried
+
+EXTRACT_PROMPT = """You extract entity mentions from a question so they can be
+looked up in a systems-engineering knowledge graph.
+
+Return every noun phrase in the question that names a concrete thing:
+a system, component, parameter, method, procedure, standard, document,
+or failure mode. Use the exact phrase as it appears in the question.
+
+Do NOT return: question words, verbs, generic words like "process" or
+"information", or anything you invent that is not in the question.
+
+Output ONE noun phrase per line, exact wording from the question.
+No preamble, no markdown, no numbering, no class labels -- just the
+phrase itself, one per line.
+If the question names no concrete entity at all, output exactly: NONE"""
+
+
+def _clean_phrase(phrase: str) -> str:
+    """Strips wrapping quotes/backticks/whitespace an LLM sometimes adds
+    around a phrase, e.g. '"OpenTCCM"' -> 'OpenTCCM'."""
+    return phrase.strip().strip("\"'`").strip()
+
+
+def _parse_entities(text: str):
+    """Turns the LLM's raw one-phrase-per-line output into a deduped
+    list of phrases, preserving first-seen order."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        phrase = _clean_phrase(line.strip().lstrip("-*0123456789. ").strip())
+        if not phrase:
+            continue
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(phrase)
+        if len(out) >= MAX_ENTITY_PHRASES:
+            break
+    return out
+
+
+def extract_query_entities(question: str):
+    """
+    Extract entity phrases from a user question via LLM.
+
+    Args:
+       question (str): The user's natural-language question.
+    Returns:
+       list[str]: exact noun phrases from the question, deduped
+       (case-insensitive), in first-seen order, capped at
+       MAX_ENTITY_PHRASES.
+
+    Behaviour:
+      - Never raises; LLM failures degrade gracefully to []
+      - Retries up to EXTRACT_MAX_RETRIES times on transient call
+        failures (timeouts, connection errors) -- a response that
+        comes back but fails to parse is NOT retried, since retrying
+        won't fix a malformed answer
+      - If the LLM returns "NONE", returns [] (no entities found)
+      - The caller (Cell 16) falls back to lexical matching when []
+        is returned
+    """
+    text = None
+    last_err = None
+
+    for attempt in range(EXTRACT_MAX_RETRIES + 1):
+        try:
+            resp = driver_llm.invoke([
+                {"role": "system", "content": EXTRACT_PROMPT},
+                {"role": "user", "content": question},
+            ])
+            text = resp.content.strip()
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if text is None:
+        print(f"  entity extraction failed after {EXTRACT_MAX_RETRIES + 1} "
+              f"attempt(s) ({last_err}) -- lexical fallback")
+        return []
+
+    if text.upper().startswith("NONE"):
+        return []
+
+    return _parse_entities(text)
+
+
+print("Defined: extract_query_entities(question)")
+print(f"Max phrases/query : {MAX_ENTITY_PHRASES}")
