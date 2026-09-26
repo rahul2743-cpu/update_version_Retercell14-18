@@ -9,29 +9,16 @@
 #   wins: rdflib evaluates a chained double-statement pattern as a
 #   near-cartesian join, and each hop multiplies it again.
 #
-#   OUTGOING ONLY (Wikipedia-style): hop 1 = the seed's own outgoing
-#   hyperlinks, hop 2 = those targets' own outgoing hyperlinks, and so
-#   on -- pure forward expansion, never looking backward at who links
-#   TO a node.
-#
-#   CONSEQUENCE OF THIS: Cell 10 only ever writes document -> entity
-#   edges (a document is always rdf:subject, never rdf:object). Under
-#   outgoing-only traversal, a seed that resolves to a pure ENTITY node
-#   (something documents link to, but which itself links to nothing)
-#   has zero outgoing edges and yields nothing at hop 1. That is
-#   expected under this model, not a bug -- a DOCUMENT seed is what
-#   drives expansion, the same way a Wikipedia article's own hyperlinks
-#   are what you follow outward from it.
+#   OUTGOING ONLY: the frontier is bound straight to ?src, so a hop only
+#   follows rdf:subject -> rdf:object edges leading OUT of the current
+#   node (Wikipedia-hyperlink style). A node that only ever appears as
+#   an ?object elsewhere is still reachable as a ?tgt, but traversal
+#   only continues past it once it is itself a ?src of some statement.
 # ==========================================================
 print("=" * 80)
 print("CELL 16 — LINKING + TRAVERSAL")
 print("=" * 80)
 
-# ---- SPARQL templates -----------------------------------------------------
-# ?src is bound directly via VALUES instead of a generic ?seed + FILTER --
-# this lets the query engine match rdf:subject straight off the frontier
-# rather than scanning every statement and filtering both sides, and it
-# makes the outgoing-only direction explicit in the query itself.
 NEIGHBOUR_QUERY_TMPL = PREFIXES + """
 SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
        ?description ?strength ?linkType
@@ -87,28 +74,20 @@ def _sparql_literal(s):
 
 
 def link_entities(phrases):
-    """Phrases (list[str]) -> [(node, label, score, phrase)]. Two passes:
-    SPARQL substring for precision, fuzzy for recall. Fuzzy only runs for
-    a phrase when the substring pass found NOTHING for it -- a clean
-    substring hit doesn't also pay for a full fuzzy scan over every label
-    in the graph."""
+    """Phrases -> [(node, label, score, phrase)]. Two passes: SPARQL
+    substring for precision, fuzzy for recall."""
     best = {}
-    for phrase in phrases:
+    for phrase, _cls in phrases:
         q = (SUBSTRING_TMPL
              .replace("%PHRASE%", _sparql_literal(phrase.lower()))
              .replace("%PREDMARK%", PREDICATE_MARKER))
-        found_substring = False
         try:
             for row in g.query(q):
                 node = str(row.node)
                 if best.get(node, (0,))[0] < 95:
                     best[node] = (95.0, phrase)
-                found_substring = True
         except Exception as e:
             print(f"  substring query failed for {phrase!r}: {e}")
-
-        if found_substring:
-            continue
 
         for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
                                            MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
@@ -138,14 +117,19 @@ def lexical_fallback(question, limit=5):
 
 
 def traverse(seeds):
-    """Outgoing-only SPARQL expansion -- one query per hop, VALUES rebound
-    to that hop's frontier. Hop 1 = each seed's own outgoing edges, hop 2
-    = those targets' own outgoing edges (Wikipedia-style forward-only
-    link following). A seed with no outgoing edges (a pure entity node --
-    see the header note above) simply contributes nothing; that's
-    expected, not a failure."""
-    edges, seen = [], set()
-    visited = {n: (0, s) for n, _l, s, _p in seeds}
+    """Iterated SPARQL expansion, OUTGOING edges only -- one query per hop,
+    VALUES rebound to that hop's frontier of source nodes.
+
+    Hop-0 = seeds themselves (not emitted as edges).
+    Hop-1 = every rdf:subject->rdf:object edge where a seed is the subject.
+    Hop-2 = every such edge where a Hop-1 target is the subject.
+    ...and so on, until MAX_HOPS or MAX_EDGES is hit.
+
+    A node that is only ever an ?object (never a ?src of a statement)
+    still appears in the edge list as a ?tgt, but nothing expands past it,
+    since it never gets the chance to sit in the VALUES block as ?src.
+    """
+    edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
     frontier = [n for n, _l, _s, _p in seeds]
 
     for hop in range(1, MAX_HOPS + 1):
@@ -169,11 +153,6 @@ def traverse(seeds):
                 continue
             seen.add(key)
 
-            # outgoing-only means src is always already-visited (a seed,
-            # or a target discovered at an earlier hop) -- no need to
-            # check both sides the way bidirectional traversal did.
-            seed_score = visited.get(src, (0, 0))[1]
-
             edges.append({
                 "source": src,
                 "source_label": str(row.srcLabel) if row.srcLabel else NODE_LABEL.get(src, src),
@@ -184,11 +163,11 @@ def traverse(seeds):
                 "strength": int(row.strength),
                 "link_type": str(row.linkType),
                 "hop": hop,
-                "seed_score": seed_score,
+                "seed_score": visited.get(src, (0, 0))[1],
             })
 
             if tgt not in visited:
-                visited[tgt] = (hop, seed_score)
+                visited[tgt] = (hop, edges[-1]["seed_score"])
                 next_frontier.append(tgt)
 
             if len(edges) >= MAX_EDGES:
@@ -199,4 +178,3 @@ def traverse(seeds):
 
 
 print("Defined: link_entities, lexical_fallback, traverse")
-print("Traversal direction: OUTGOING ONLY (Wikipedia-style forward link following)")
