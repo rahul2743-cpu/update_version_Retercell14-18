@@ -1,0 +1,122 @@
+# ==========================================================
+# Cell 14 : RETRIEVER SETUP
+#
+#   Prepares everything the retriever needs. Does NOT answer any
+#   question here -- config, indexes, and a gate that verifies the
+#   graph can actually be queried before Cell 15 onward runs.
+#
+#   PREREQUISITE: Cell 12's DOC_QUERY must select `?doc a ex:Document`
+#   (matches the type Cell 11 actually writes). Without this, no node
+#   carries `content` and every answer downstream is ungrounded.
+# ==========================================================
+import re
+import math
+from collections import defaultdict
+
+print("=" * 80)
+print("CELL 14 — RETRIEVER SETUP")
+print("=" * 80)
+
+# ---- Config -------------------------------------------------------------
+KG_BASE = BASE
+
+MAX_HOPS = 2                 # 1 = direct facts only, 2 = adds sibling context
+HOP_DECAY = 0.45             # hop-2 evidence worth ~45% of hop-1
+MATCH_CUTOFF = 72            # fuzzy score floor, 0-100. Lower = more recall
+MAX_SEEDS_PER_PHRASE = 3
+MAX_FRONTIER = 60            # nodes carried into the next hop
+MAX_EDGES = 400              # hard stop before ranking
+GROUND_ENTITY_SEEDS = True
+MAX_TRIPLES = 40
+MAX_DOCS = 4
+MAX_DOC_CHARS = 2500
+MAX_CONTEXT_CHARS = 14000
+TRIPLE_BUDGET_FRAC = 0.55    # share of context reserved for relationships
+
+PREFIXES = f"""
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ex:   <{KG_BASE}schema/>
+PREFIX cls:  <{KG_BASE}class/>
+"""
+PREDICATE_MARKER = f"{KG_BASE}predicate/"
+
+# ---- Step 1: label index ------------------------------------------------
+LABEL_QUERY = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE { ?node rdfs:label ?label . }
+"""
+
+NODE_LABEL = {}
+LABEL_TO_NODES = defaultdict(list)
+
+for row in g.query(LABEL_QUERY):
+    node, label = str(row.node), str(row.label).strip()
+    if not label or node.startswith(PREDICATE_MARKER):
+        continue
+    NODE_LABEL[node] = label
+    LABEL_TO_NODES[label.lower()].append(node)
+
+ALL_LABELS = list(LABEL_TO_NODES.keys())
+print(f"Entity nodes indexed  : {len(NODE_LABEL)}")
+print(f"Distinct labels       : {len(ALL_LABELS)}")
+
+# ---- Step 2: which nodes carry document text ----------------------------
+CONTENT_NODES = {
+    str(r.doc)
+    for r in g.query(PREFIXES + "SELECT ?doc WHERE { ?doc ex:documentContent ?c . }")
+}
+print(f"Nodes with content    : {len(CONTENT_NODES)}")
+
+# ---- Step 3: is the reification queryable --------------------------------
+_n_stmt = int(list(g.query(PREFIXES + """
+SELECT (COUNT(?s) AS ?n)
+WHERE { ?s a rdf:Statement ; ex:description ?d ; ex:strength ?w . }
+"""))[0].n)
+print(f"Reified statements    : {_n_stmt}")
+
+# ---- Gate: refuse to continue on a graph that cannot answer --------------
+_fatal = []
+if not ALL_LABELS:
+    _fatal.append("no rdfs:label in g -- rerun Cell 11")
+if not CONTENT_NODES:
+    _fatal.append("no ex:documentContent -- rerun Cell 11")
+if _n_stmt == 0:
+    _fatal.append("no reified statements -- traversal has nothing to walk")
+if _fatal:
+    print("\nSTOP:")
+    for f in _fatal:
+        print(f"  - {f}")
+    raise RuntimeError(
+        "Retriever gate failed -- graph is not queryable: "
+        + "; ".join(_fatal)
+    )
+else:
+    print("\nGraph is queryable.")
+
+# ---- Step 4: matcher ------------------------------------------------------
+try:
+    from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
+
+    def fuzzy_match(query, choices, limit, cutoff):
+        return [(m, s) for m, s, _ in _rf_process.extract(
+            query, choices, scorer=_rf_fuzz.WRatio, limit=limit, score_cutoff=cutoff)]
+    print("Matcher : rapidfuzz")
+except ImportError:
+    import difflib
+
+    def fuzzy_match(query, choices, limit, cutoff):
+        hits = difflib.get_close_matches(query, choices, n=limit, cutoff=cutoff / 100.0)
+        return [(h, difflib.SequenceMatcher(None, query, h).ratio() * 100) for h in hits]
+    print("Matcher : difflib  (pip install rapidfuzz for better recall)")
+
+# ---- Step 5: LLM ------------------------------------------------------
+try:
+    driver_llm
+    print("LLM     : reusing driver_llm from Cell 9")
+except NameError:
+    from langchain_openai import ChatOpenAI
+    driver_llm = ChatOpenAI(model=DEPLOYMENT_NAME,
+                            base_url="https://adb-3955688708870984.4.azuredatabricks.net/serving-endpoints",
+                            api_key=DATABRICKS_TOKEN, temperature=0)
+    print("LLM     : built a new driver_llm")
