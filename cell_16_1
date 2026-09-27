@@ -1,36 +1,5 @@
 # ==========================================================
 # Cell 16 : LINKING + TRAVERSAL  (SPARQL, no LLM)
-#
-#   ITERATED, NOT A PROPERTY PATH: SPARQL property paths require fixed
-#   predicate IRIs -- variables are illegal inside a path -- and the
-#   {n,m} cardinality forms were removed from SPARQL 1.1 before it was
-#   finalised. With distinct predicates per relationship, the options
-#   are a chained-statement query or an iterated 1-hop query. Iterating
-#   wins: rdflib evaluates a chained double-statement pattern as a
-#   near-cartesian join, and each hop multiplies it again.
-#
-#   OUTGOING ONLY: Cell 10 writes document -> entity edges as directed
-#   links, and the desired traversal semantics are "what does this
-#   node point to" (like following outbound Wikipedia links), not
-#   "what points to this node". So VALUES binds directly onto ?src --
-#   never onto ?tgt -- meaning a node only ever expands via its own
-#   outgoing statements.
-#
-#   A node reached as ?tgt becomes the frontier for the next hop.
-#   On the next iteration it is bound as ?src, allowing us to follow
-#   its outgoing edges. If it has no outgoing statements, it naturally
-#   stops expanding.
-#
-#   SEED MATCHING (this cell's fix): the old precision pass used
-#   SPARQL CONTAINS(label, phrase) -- i.e. the LABEL had to contain
-#   the whole PHRASE as a substring. Extracted phrases are usually
-#   LONGER than canonical labels (they carry the question's own
-#   wording -- e.g. "actual engine oil consumption" vs. the label
-#   "Engine Oil Consumption"), so that containment direction almost
-#   never holds and seed lookup silently fails. Replaced with a
-#   symmetric token-overlap (F1) score against Cell 14's own label
-#   index -- no SPARQL round-trip, no word lists, nothing
-#   content-specific, and it doesn't care which side is longer.
 # ==========================================================
 print("=" * 80)
 print("CELL 16 — LINKING + TRAVERSAL (outgoing-only)")
@@ -72,13 +41,11 @@ def _tokens(s):
             if t not in _STOP and len(t) > 2}
 
 
-def _token_f1(phrase_tokens, label_tokens):
-    """Symmetric overlap score, 0-100. Unlike CONTAINS, direction
-    doesn't matter: recall (how much of the LABEL the phrase covers)
-    and precision (how much of the PHRASE the label covers) are both
-    measured, so a phrase with extra qualifier words still scores
-    well as long as it fully covers the label -- recall stays 1.0,
-    only precision softens the score."""
+def _token_score(phrase_tokens, label_tokens):
+    """Recall-weighted overlap, 0-100. Full label coverage (recall=1.0)
+    is what indicates 'this label is what the phrase is about' -- extra
+    qualifier words in the phrase (lower precision) should only lightly
+    discount that, not disqualify it."""
     if not phrase_tokens or not label_tokens:
         return 0.0
     inter = phrase_tokens & label_tokens
@@ -86,7 +53,8 @@ def _token_f1(phrase_tokens, label_tokens):
         return 0.0
     recall = len(inter) / len(label_tokens)
     precision = len(inter) / len(phrase_tokens)
-    return 100.0 * (2 * recall * precision / (recall + precision))
+    RECALL_WEIGHT = 0.75
+    return 100.0 * (RECALL_WEIGHT * recall + (1 - RECALL_WEIGHT) * precision)
 
 
 def _values_block(uris):
@@ -94,20 +62,13 @@ def _values_block(uris):
 
 
 def link_entities(phrases):
-    """Phrases -> [(node, label, score, phrase)]. Two passes, both
-    non-directional so extra/missing words in the extracted phrase
-    don't silently kill the match:
-      1. token-overlap (F1), against Cell 14's LABEL_TO_NODES index
-      2. character fuzzy (fuzzy_match), for typos / rewordings that
-         token overlap alone would miss
-    """
     best = {}
     for phrase, _cls in phrases:
         p_tok = _tokens(phrase)
 
         if p_tok:
             for label_lc, nodes in LABEL_TO_NODES.items():
-                score = _token_f1(p_tok, _tokens(label_lc))
+                score = _token_score(p_tok, _tokens(label_lc))
                 if score < MATCH_CUTOFF:
                     continue
                 for node in nodes:
@@ -125,8 +86,6 @@ def link_entities(phrases):
 
 
 def lexical_fallback(question, limit=5):
-    """No LLM, no embeddings. Used when extraction returns nothing or
-    nothing links."""
     q_tokens = _tokens(question)
     if not q_tokens:
         return []
@@ -142,18 +101,6 @@ def lexical_fallback(question, limit=5):
 
 
 def traverse(seeds, debug=False):
-    """Iterated SPARQL expansion -- one query per hop, VALUES rebound to
-    that hop's frontier. OUTGOING ONLY: the frontier binds to ?src, so
-    each hop only follows src -> tgt edges forward.
-
-    `visited` stores (hop, seed_score, seed_node) per node, so every
-    reached node -- and every edge built from it -- can be traced back
-    to the seed that produced it. Known limitation: if two different
-    seeds both reach the same downstream node, only the first one seen
-    (in query result order) sets that node's provenance; switch to
-    storing a list of (hop, score, seed_node) per node if you later
-    need multi-seed provenance.
-    """
     edges, seen = [], set()
     visited = {n: (0, s, n) for n, _l, s, _p in seeds}
     frontier = [n for n, _l, _s, _p in seeds]
@@ -161,7 +108,6 @@ def traverse(seeds, debug=False):
     for hop in range(1, MAX_HOPS + 1):
         if not frontier or len(edges) >= MAX_EDGES:
             break
-
         if debug:
             print(f"\n--- HOP {hop} ---")
             print(f"Frontier nodes: {len(frontier)}")
@@ -188,12 +134,6 @@ def traverse(seeds, debug=False):
                 continue
             seen.add(key)
 
-            # `src` must already be in `visited`: the current frontier is
-            # constructed only from previously discovered nodes (seeds, or
-            # earlier hops' tgt values), and every node is written into
-            # `visited` at the same moment it's added to `next_frontier`.
-            # A KeyError here would mean that invariant broke -- fail loudly
-            # rather than silently falling back to seed_score=0.
             src_hop, src_score, src_seed_node = visited[src]
 
             edges.append({
@@ -211,9 +151,6 @@ def traverse(seeds, debug=False):
             })
             added_this_hop += 1
 
-            # OUTGOING ONLY: src is already in `visited` (it was the
-            # frontier we just queried). Only tgt is new, and only tgt
-            # advances to the next hop's frontier.
             if tgt not in visited:
                 visited[tgt] = (hop, src_score, src_seed_node)
                 next_frontier.append(tgt)
@@ -228,14 +165,5 @@ def traverse(seeds, debug=False):
 
     return edges, visited
 
-
-phrases = extract_query_entities(
-    "Why is it important to keep actual engine oil consumption well below the maximum allowable limit?"
-)
-print("Extracted:", phrases)
-
-seeds = link_entities(phrases)
-for node, label, score, phrase in seeds:
-    print(f"{score:5.1f}  {label!r:45s}  <-  {phrase!r}")
 
 print("Defined: link_entities, lexical_fallback, traverse (outgoing-only, with seed provenance)")
