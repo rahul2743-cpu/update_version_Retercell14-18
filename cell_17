@@ -27,6 +27,9 @@
 #
 #   Definitions only. Nothing runs here -- ask a question in a new
 #   cell with:  kg_answer("your question")
+#   (The inline-anchor cache below is built lazily, on first use inside
+#   kg_retrieve/pick_documents -- not at cell-load time -- so this
+#   comment is actually true now.)
 # ==========================================================
 print("=" * 80)
 print("CELL 17 — RANK, ORDER, ASSEMBLE, ANSWER")
@@ -61,10 +64,22 @@ engineering wiki.
 # Importance: degree (default) or PageRank (optional)
 # ----------------------------------------------------------
 
+_DEGREE_WARNED = False  # only print the failure warning once, not per-edge
+
+
 def _degree(node):
+    """Falls back to 0 on failure (e.g. G not built, wrong node-key
+    scheme), but only silently -- the first failure prints a one-time
+    warning so a broken importance graph doesn't disappear without a
+    trace, unlike a bare try/except that swallows everything forever."""
+    global _DEGREE_WARNED
     try:
         return G.degree(node) if node in G else 0
-    except Exception:
+    except Exception as e:
+        if not _DEGREE_WARNED:
+            print(f"  _degree failed ({e}) -- importance scores may be "
+                  f"degraded for the rest of this session")
+            _DEGREE_WARNED = True
         return 0
 
 
@@ -154,13 +169,32 @@ def _extract_anchors(text):
     return {m.strip() for m in _ANCHOR_RE.findall(text or "") if m.strip()}
 
 
-_DOC_ANCHOR_CACHE = {}  # doc_node -> [(anchor_text, token_set), ...]
+def _token_score(a_tok, b_tok):
+    """Token-overlap similarity between two already-tokenized sets, on
+    a 0-100 scale to match lexical_fallback's convention in Cell 16.
+    Symmetric (max of the two set sizes as denominator) since neither
+    an anchor text nor a seed label is inherently the 'reference'."""
+    if not a_tok or not b_tok:
+        return 0.0
+    overlap = a_tok & b_tok
+    if not overlap:
+        return 0.0
+    return 100.0 * len(overlap) / max(len(a_tok), len(b_tok))
+
+
+_DOC_ANCHOR_CACHE = {}       # doc_node -> [(anchor_text, token_set), ...]
+_DOC_ANCHOR_CACHE_BUILT = False  # guards lazy one-time build
 
 
 def _build_doc_anchor_cache():
     """Scans every content-bearing node ONCE for its inline anchors,
     caching tokenized titles so this never re-scans document text at
-    query time. Same caching pattern as _LABEL_TOKENS in Cell 16."""
+    query time. Same caching pattern as _LABEL_TOKENS in Cell 16.
+
+    Called lazily (see _ensure_doc_anchor_cache below), not at cell
+    load time -- this cell's header promises "nothing runs here" and
+    this call is not free (one SPARQL fetch over every CONTENT_NODES
+    entry), so it only fires on first actual retrieval."""
     global _DOC_ANCHOR_CACHE
     _DOC_ANCHOR_CACHE = {}
     if not CONTENT_NODES:
@@ -181,15 +215,22 @@ def _build_doc_anchor_cache():
     print(f"Inline-anchor cache : {len(_DOC_ANCHOR_CACHE)} documents, {n_anchors} anchors")
 
 
-_build_doc_anchor_cache()
+def _ensure_doc_anchor_cache():
+    """Builds the anchor cache on first use only. Safe to call every
+    time pick_documents runs -- the guard makes every call after the
+    first a no-op."""
+    global _DOC_ANCHOR_CACHE_BUILT
+    if not _DOC_ANCHOR_CACHE_BUILT:
+        _build_doc_anchor_cache()
+        _DOC_ANCHOR_CACHE_BUILT = True
 
 
 def _inline_link_boost(doc_node, seed_labels):
     """How strongly THIS document's own inline hyperlinks point at the
     entities the query resolved to -- independent of whether Cell 10
-    ever turned that link into a graph edge. Uses the same _token_score
-    function Cell 16 uses for seed matching, so the two signals are on
-    a consistent scale."""
+    ever turned that link into a graph edge. Uses _token_score (defined
+    above) on a 0-100 scale, consistent with lexical_fallback's scoring
+    convention in Cell 16."""
     anchors = _DOC_ANCHOR_CACHE.get(doc_node)
     if not anchors:
         return 0.0
@@ -216,6 +257,8 @@ def pick_documents(ranked_edges, seeds):
          graph traversal can't reach because Cell 10 skips doc:wiki
          links when building edges.
     """
+    _ensure_doc_anchor_cache()
+
     seed_labels = [l for _, l, _, _ in seeds]
 
     doc_score = defaultdict(float)
