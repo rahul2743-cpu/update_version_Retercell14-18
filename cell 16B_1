@@ -1,0 +1,49 @@
+# ==========================================================
+# DIAGNOSTIC (generic): for a given question, run the real
+# extraction pipeline, then show every label in the graph that
+# shares any token with each extracted phrase -- unfiltered by
+# MATCH_CUTOFF, so you can see the full candidate field instead
+# of just whatever survived the cutoff.
+#
+# Nothing here is specific to any question or entity -- swap
+# QUESTION for anything and it works the same way.
+# ==========================================================
+
+def diagnose_linking(question: str, top_n: int = 25):
+    phrases = extract_query_entities(question)
+    print(f"Question: {question}")
+    print(f"Extracted phrases: {phrases}\n")
+
+    if not phrases:
+        print("No phrases extracted -- nothing to diagnose.")
+        return
+
+    for phrase, cls in phrases:
+        p_tok = _tokens(phrase)
+        print("=" * 90)
+        print(f"PHRASE: {phrase!r}  ({cls})")
+        print(f"tokens: {p_tok}")
+        print("-" * 90)
+
+        candidates = []
+        for label_lc, nodes in LABEL_TO_NODES.items():
+            l_tok = _tokens(label_lc)
+            overlap = p_tok & l_tok
+            if overlap:
+                score = _token_score(p_tok, l_tok)  # same scorer link_entities uses
+                candidates.append((score, label_lc, len(nodes), l_tok, overlap))
+
+        candidates.sort(key=lambda x: -x[0])
+
+        if not candidates:
+            print("  (no label shares any token with this phrase)")
+        else:
+            print(f"  {'score':>6}  {'label':45s} {'label_tokens':30s} overlap")
+            for score, label_lc, n_nodes, l_tok, overlap in candidates[:top_n]:
+                flag = "  <-- below MATCH_CUTOFF" if score < MATCH_CUTOFF else ""
+                print(f"  {score:6.1f}  {label_lc:45s} {str(l_tok):30s} {overlap}{flag}")
+        print()
+
+
+# Usage -- pass whatever question you're debugging:
+diagnose_linking("Why is it important to keep actual engine oil consumption well below the maximum allowable limit?")
