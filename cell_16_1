@@ -229,4 +229,13 @@ def traverse(seeds, debug=False):
     return edges, visited
 
 
+phrases = extract_query_entities(
+    "Why is it important to keep actual engine oil consumption well below the maximum allowable limit?"
+)
+print("Extracted:", phrases)
+
+seeds = link_entities(phrases)
+for node, label, score, phrase in seeds:
+    print(f"{score:5.1f}  {label!r:45s}  <-  {phrase!r}")
+
 print("Defined: link_entities, lexical_fallback, traverse (outgoing-only, with seed provenance)")
