@@ -9,25 +9,22 @@
 #   wins: rdflib evaluates a chained double-statement pattern as a
 #   near-cartesian join, and each hop multiplies it again.
 #
-#   OUTGOING ONLY: the frontier is bound straight to ?src, so a hop only
-#   follows rdf:subject -> rdf:object edges leading OUT of the current
-#   node (Wikipedia-hyperlink style).
-#
-#   QUERY-GUIDED BEAM: blind BFS expands every frontier node's full
-#   out-edge set and, once over MAX_FRONTIER, keeps whichever nodes were
-#   discovered first -- not the ones on-topic. Instead, every candidate
-#   next-hop node is scored against the question (label overlap) plus
-#   its edge strength, and only the top BEAM_WIDTH survive to seed the
-#   next hop. All edges seen are still kept (cell 17 ranks/selects the
-#   top 10 from the full edge list) -- only which nodes get EXPANDED
-#   FURTHER is pruned, exactly like following the most relevant links
-#   on a page rather than every link on the page.
+#   OUTGOING ONLY: the walk follows ?src -> ?tgt only, like clicking
+#   forward through hyperlinks -- Doc A's hop-1 frontier is whatever
+#   A points to, hop-2 is whatever THOSE nodes point to, and so on.
+#   We no longer FILTER(?src = ?seed || ?tgt = ?seed): binding ?src
+#   straight to the frontier VALUES makes the "outgoing edges of these
+#   nodes" query directly, instead of "any edge touching these nodes"
+#   and then discarding half of it. This also means an entity or
+#   parameter seed (which Cell 10 only ever writes as an ?tgt, never
+#   an ?src) has no outgoing edges of its own and stops expanding at
+#   hop 1 -- that is intentional now, not a bug: only documents carry
+#   the walk forward, exactly like the source example in this cell's
+#   docstring.
 # ==========================================================
 print("=" * 80)
 print("CELL 16 — LINKING + TRAVERSAL")
 print("=" * 80)
-
-BEAM_WIDTH = globals().get("BEAM_WIDTH", 8)  # nodes carried forward per hop
 
 NEIGHBOUR_QUERY_TMPL = PREFIXES + """
 SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
@@ -83,18 +80,6 @@ def _sparql_literal(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _relevance(label, q_tokens, strength, seed_score):
-    """Score a candidate next-hop node: query-label overlap first,
-    edge strength second, inherited seed_score as a tiebreaker."""
-    if q_tokens:
-        lbl_tokens = _tokens(label)
-        overlap = len(lbl_tokens & q_tokens)
-        topical = 100.0 * overlap / max(len(q_tokens), 1)
-    else:
-        topical = 0.0
-    return topical * 2.0 + strength * 5.0 + seed_score * 0.1
-
-
 def link_entities(phrases):
     """Phrases -> [(node, label, score, phrase)]. Two passes: SPARQL
     substring for precision, fuzzy for recall."""
@@ -138,21 +123,15 @@ def lexical_fallback(question, limit=5):
     return scored[:limit]
 
 
-def traverse(seeds, question=None):
-    """Iterated SPARQL expansion, OUTGOING edges only, QUERY-GUIDED BEAM.
-
-    Hop-0 = seeds themselves (not emitted as edges).
-    Hop-1 = every rdf:subject->rdf:object edge where a seed is the subject.
-             Every discovered target is scored against `question`; only the
-             top BEAM_WIDTH become next hop's frontier.
-    Hop-2 = same, expanding only from that pruned frontier.
-    ...continues until MAX_HOPS or MAX_EDGES.
-
-    All edges found at every hop are kept in the returned edge list --
-    pruning only affects which nodes get expanded further, not what gets
-    reported back. Cell 17 ranks/selects the top-N from this full set.
-    """
-    q_tokens = _tokens(question) if question else set()
+def traverse(seeds):
+    """Iterated SPARQL expansion -- one query per hop, OUTGOING edges
+    only. The frontier passed into hop N+1 is exactly the set of ?tgt
+    nodes newly reached at hop N (never the ?src side, which is already
+    a seed or already visited by construction). This grows a directed
+    subgraph -- seed -> hop1 targets -> hop2 targets -> ... -- the same
+    way you'd fan out across Wikipedia by only clicking outgoing links,
+    rather than an undirected ball that also pulls in everything that
+    happens to link TO a node."""
     edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
     frontier = [n for n, _l, _s, _p in seeds]
 
@@ -168,7 +147,7 @@ def traverse(seeds, question=None):
             print(f"  hop {hop} query failed: {e}")
             break
 
-        candidates = []  # (score, tgt) for nodes newly seen this hop
+        next_frontier = []
         for row in rows:
             src, tgt = str(row.src), str(row.tgt)
             pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
@@ -177,35 +156,29 @@ def traverse(seeds, question=None):
                 continue
             seen.add(key)
 
-            strength = int(row.strength)
-            tgt_label = str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt)
-            seed_score = visited.get(src, (0, 0))[1]
-
             edges.append({
                 "source": src,
                 "source_label": str(row.srcLabel) if row.srcLabel else NODE_LABEL.get(src, src),
                 "predicate": pred,
                 "target": tgt,
-                "target_label": tgt_label,
+                "target_label": str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt),
                 "description": str(row.description),
-                "strength": strength,
+                "strength": int(row.strength),
                 "link_type": str(row.linkType),
                 "hop": hop,
-                "seed_score": seed_score,
+                # src is always already visited (seed or a prior hop's target),
+                # so its seed_score is the only side that can carry provenance
+                "seed_score": visited.get(src, (0, 0))[1],
             })
 
+            # outgoing-only: only ?tgt is a newly discovered node.
             if tgt not in visited:
-                score = _relevance(tgt_label, q_tokens, strength, seed_score)
-                visited[tgt] = (hop, score)
-                candidates.append((score, tgt))
+                visited[tgt] = (hop, edges[-1]["seed_score"])
+                next_frontier.append(tgt)
 
             if len(edges) >= MAX_EDGES:
                 break
-
-        # Query-guided beam: keep only the top BEAM_WIDTH scoring nodes
-        # to expand from next hop, instead of every node discovered.
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        frontier = [tgt for _score, tgt in candidates[:BEAM_WIDTH]]
+        frontier = next_frontier
 
     return edges, visited
 
