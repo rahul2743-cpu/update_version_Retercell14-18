@@ -1,0 +1,339 @@
+# ==========================================================
+# Cell 17 : RANK, ORDER, ASSEMBLE, ANSWER
+#
+#   score = match quality x hop decay x relationship strength x importance
+#   "importance" is either plain degree (default) or PageRank if
+#   USE_PAGERANK is turned on below -- see PAGERANK_SCORES.
+#
+#   ORDERING: after ranking picks WHICH triplets to keep, order_bfs()
+#   decides what SEQUENCE to present them in. Saleh et al. (SG-RAG MOT,
+#   2025) found that presenting triplets in graph-traversal order (BFS
+#   from the seed) measurably outperformed random or score order,
+#   because each triplet stays connected to one already seen -- this
+#   helps the LLM chain through the context instead of reading
+#   disconnected facts ("lost in the middle"). Ranking still decides
+#   inclusion; BFS only decides the sequence of what was already kept.
+#
+#   INLINE-LINK RELEVANCE: Cell 10 skips doc:wiki links when building
+#   graph edges (IGNORE_LINK_TYPES), so those relationships never
+#   become traversable edges in G -- traverse() can never reach a
+#   document through one. But the rendered <Title> hyperlink markers
+#   (Cell 8d) are still sitting in each document's own content. This
+#   cell recovers that as a SECOND relevance signal in pick_documents:
+#   does a document's own inline anchors point at the entities the
+#   query resolved to, independent of whether graph traversal ever
+#   reached that document. This is additive -- it does not add the
+#   missing relationships back into G itself.
+#
+#   Definitions only. Nothing runs here -- ask a question in a new
+#   cell with:  kg_answer("your question")
+# ==========================================================
+print("=" * 80)
+print("CELL 17 — RANK, ORDER, ASSEMBLE, ANSWER")
+print("=" * 80)
+
+USE_BFS_ORDERING = True   # False reverts to pure score order
+USE_PAGERANK = False      # True swaps degree-based importance for PageRank
+                          # -- off by default so behavior doesn't change
+                          # unless deliberately enabled
+
+ANSWER_PROMPT = """---Role---
+You answer questions using ONLY a knowledge graph extracted from an
+engineering wiki.
+
+---Context you are given---
+1. RELATIONSHIPS: lines of the form
+   Source --[predicate, strength]--> Target : explanation
+   Strength is 1-10, how explicit that relationship is in the source.
+2. DOCUMENTS: the full text of the most relevant source pages.
+
+---Rules---
+- Ground every claim in the context above. Do not use outside knowledge.
+- Prefer high-strength relationships and direct document text over weak,
+  distant ones.
+- Cite the document titles you used, in a "Sources:" line at the end.
+- If the context does not contain the answer, say so plainly and name
+  the closest thing it DOES contain. Do not guess.
+- Be concise. No preamble."""
+
+
+# ----------------------------------------------------------
+# Importance: degree (default) or PageRank (optional)
+# ----------------------------------------------------------
+
+def _degree(node):
+    try:
+        return G.degree(node) if node in G else 0
+    except Exception:
+        return 0
+
+
+PAGERANK_SCORES = {}
+if USE_PAGERANK:
+    try:
+        PAGERANK_SCORES = nx.pagerank(G, weight="strength")
+        print(f"PageRank computed for {len(PAGERANK_SCORES)} nodes")
+    except Exception as e:
+        print(f"  pagerank failed ({e}) -- falling back to degree-only ranking")
+        PAGERANK_SCORES = {}
+
+_MAX_PR = max(PAGERANK_SCORES.values()) if PAGERANK_SCORES else 1.0
+
+
+def _pagerank(node):
+    return PAGERANK_SCORES.get(node, 0.0)
+
+
+def _importance(src, tgt):
+    if PAGERANK_SCORES:
+        pr = (_pagerank(src) + _pagerank(tgt)) / (_MAX_PR or 1.0)
+        return 1.0 + pr
+    deg = _degree(src) + _degree(tgt)
+    return 1.0 + math.log1p(deg) / 12.0
+
+
+def rank_edges(edges):
+    """Decides WHICH edges matter. Scoring only -- order is decided
+    separately by order_bfs()."""
+    for e in edges:
+        e["score"] = ((e["seed_score"] / 100.0)
+                      * (HOP_DECAY ** (e["hop"] - 1))
+                      * (e["strength"] / 10.0)
+                      * _importance(e["source"], e["target"]))
+    return sorted(edges, key=lambda x: x["score"], reverse=True)
+
+
+def order_bfs(top_edges, seeds):
+    """Re-sequences an already-ranked set of edges by BFS from the seed
+    nodes (Saleh et al., 2025). Inclusion was already decided by
+    rank_edges; this only changes presentation order.
+
+    Any edge BFS never reaches is appended at the end in rank order,
+    so nothing is silently dropped."""
+    if not top_edges:
+        return top_edges
+
+    by_node = defaultdict(list)
+    for e in top_edges:
+        by_node[e["source"]].append(e)
+        by_node[e["target"]].append(e)
+
+    ordered, seen_ids, queue = [], set(), []
+    for n, _l, _s, _p in seeds:
+        if n in by_node:
+            queue.append(n)
+
+    visited_nodes = set(queue)
+    while queue:
+        node = queue.pop(0)
+        for e in by_node.get(node, []):
+            eid = id(e)
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            ordered.append(e)
+            other = e["target"] if e["source"] == node else e["source"]
+            if other not in visited_nodes:
+                visited_nodes.add(other)
+                queue.append(other)
+
+    leftover = [e for e in top_edges if id(e) not in seen_ids]
+    return ordered + leftover
+
+
+# ----------------------------------------------------------
+# Inline hyperlink relevance (recovers doc:wiki-skipped signal)
+# ----------------------------------------------------------
+
+_ANCHOR_RE = re.compile(r"<([^<>]{1,120})>")
+
+
+def _extract_anchors(text):
+    """Every inline <Title> hyperlink marker in a rendered document.
+    Purely parses existing markup -- no titles hardcoded."""
+    return {m.strip() for m in _ANCHOR_RE.findall(text or "") if m.strip()}
+
+
+_DOC_ANCHOR_CACHE = {}  # doc_node -> [(anchor_text, token_set), ...]
+
+
+def _build_doc_anchor_cache():
+    """Scans every content-bearing node ONCE for its inline anchors,
+    caching tokenized titles so this never re-scans document text at
+    query time. Same caching pattern as _LABEL_TOKENS in Cell 16."""
+    global _DOC_ANCHOR_CACHE
+    _DOC_ANCHOR_CACHE = {}
+    if not CONTENT_NODES:
+        return
+    block = _values_block(list(CONTENT_NODES))
+    if not block:
+        return
+    try:
+        rows = list(g.query(DOC_CONTENT_TMPL.replace("%DOCS%", block)))
+    except Exception as e:
+        print(f"  anchor cache build failed: {e}")
+        return
+    for row in rows:
+        doc = str(row.doc)
+        anchors = _extract_anchors(str(row.content))
+        _DOC_ANCHOR_CACHE[doc] = [(a, _tokens(a)) for a in anchors]
+    n_anchors = sum(len(v) for v in _DOC_ANCHOR_CACHE.values())
+    print(f"Inline-anchor cache : {len(_DOC_ANCHOR_CACHE)} documents, {n_anchors} anchors")
+
+
+_build_doc_anchor_cache()
+
+
+def _inline_link_boost(doc_node, seed_labels):
+    """How strongly THIS document's own inline hyperlinks point at the
+    entities the query resolved to -- independent of whether Cell 10
+    ever turned that link into a graph edge. Uses the same _token_score
+    function Cell 16 uses for seed matching, so the two signals are on
+    a consistent scale."""
+    anchors = _DOC_ANCHOR_CACHE.get(doc_node)
+    if not anchors:
+        return 0.0
+    best = 0.0
+    for label in seed_labels:
+        l_tok = _tokens(label)
+        if not l_tok:
+            continue
+        for _anchor_text, a_tok in anchors:
+            best = max(best, _token_score(a_tok, l_tok) / 100.0)
+    return best
+
+
+# ----------------------------------------------------------
+# Document selection & fetch
+# ----------------------------------------------------------
+
+def pick_documents(ranked_edges, seeds):
+    """Two relevance signals, combined:
+      1. Graph-edge relevance: documents reached via traverse(),
+         scored by the strength/ranking of connecting edges.
+      2. Inline-link relevance: any document whose own <Title>
+         anchors point at the seed entities -- recovers documents
+         graph traversal can't reach because Cell 10 skips doc:wiki
+         links when building edges.
+    """
+    seed_labels = [l for _, l, _, _ in seeds]
+
+    doc_score = defaultdict(float)
+    for e in ranked_edges:
+        for side in ("source", "target"):
+            if e[side] in CONTENT_NODES:
+                doc_score[e[side]] += e["score"]
+
+    for doc_node in CONTENT_NODES:
+        boost = _inline_link_boost(doc_node, seed_labels)
+        if boost > 0:
+            doc_score[doc_node] += boost
+
+    return [n for n, _ in sorted(doc_score.items(),
+                                 key=lambda kv: kv[1], reverse=True)[:MAX_DOCS]]
+
+
+def fetch_documents(doc_nodes):
+    """One SPARQL call for all chosen documents, not one per document."""
+    if not doc_nodes:
+        return []
+    block = _values_block(doc_nodes)
+    if not block:
+        return []
+    try:
+        rows = list(g.query(DOC_CONTENT_TMPL.replace("%DOCS%", block)))
+    except Exception as e:
+        print(f"  document fetch failed: {e}")
+        return []
+    order = {n: i for i, n in enumerate(doc_nodes)}
+    docs = [(str(r.doc),
+             str(r.label) if r.label else NODE_LABEL.get(str(r.doc), str(r.doc)),
+             str(r.content)) for r in rows]
+    docs.sort(key=lambda d: order.get(d[0], 999))
+    return docs
+
+
+def build_context(ordered_edges, docs):
+    lines, used = ["### RELATIONSHIPS"], 0
+    for e in ordered_edges[:MAX_TRIPLES]:
+        line = (f"{e['source_label']} --[{e['predicate']}, {e['strength']}]--> "
+                f"{e['target_label']} : {e['description']}")
+        if used + len(line) > MAX_CONTEXT_CHARS * TRIPLE_BUDGET_FRAC:
+            break
+        lines.append(line)
+        used += len(line)
+
+    lines.append("\n### DOCUMENTS")
+    for _uri, label, content in docs:
+        block = f"\n--- {label} ---\n{content[:MAX_DOC_CHARS]}"
+        if used + len(block) > MAX_CONTEXT_CHARS:
+            break
+        lines.append(block)
+        used += len(block)
+
+    return "\n".join(lines), used
+
+
+# ----------------------------------------------------------
+# Retrieval + answer
+# ----------------------------------------------------------
+
+def kg_retrieve(question, verbose=True):
+    """Retrieval only, no generation -- so retrieval can be debugged
+    without spending an LLM call on the answer."""
+    phrases = extract_query_entities(question)
+    seeds = link_entities(phrases) if phrases else []
+
+    fallback_used = False
+    if not seeds:
+        seeds, fallback_used = lexical_fallback(question), True
+
+    if not seeds:
+        return {"question": question, "phrases": phrases, "seeds": [], "edges": [],
+                "docs": [], "context": "", "fallback_used": fallback_used}
+
+    edges, _ = traverse(seeds)
+    ranked = rank_edges(edges)
+
+    top = ranked[:MAX_TRIPLES]
+    presented = order_bfs(top, seeds) if USE_BFS_ORDERING else top
+
+    docs = fetch_documents(pick_documents(ranked, seeds))
+    context, n_chars = build_context(presented, docs)
+
+    if verbose:
+        print(f"\nQ : {question}")
+        print(f"  entities  : {[p for p, _ in phrases]}")
+        print(f"  seeds     : {[l for _, l, _, _ in seeds[:5]]}"
+              f"{'  (FALLBACK)' if fallback_used else ''}")
+        print(f"  edges     : {len(edges)} -> kept {len(top)}"
+              f"{'  (BFS ordered)' if USE_BFS_ORDERING else '  (score ordered)'}")
+        print(f"  documents : {[d[1] for d in docs]}")
+        print(f"  context   : {n_chars} chars")
+
+    return {"question": question, "phrases": phrases, "seeds": seeds,
+            "edges": presented, "docs": docs, "context": context,
+            "fallback_used": fallback_used}
+
+
+def kg_answer(question, verbose=True):
+    r = kg_retrieve(question, verbose=verbose)
+    if not r["context"]:
+        r["answer"] = ("No entity in this question matches any node in the "
+                       "knowledge graph, so there is nothing to ground an answer on.")
+        return r
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": ANSWER_PROMPT},
+            {"role": "user", "content": f"{r['context']}\n\n---QUESTION---\n{question}"},
+        ])
+        r["answer"] = resp.content.strip()
+    except Exception as e:
+        r["answer"] = f"[generation failed: {e}]"
+    return r
+
+
+print(f"BFS ordering : {'ON' if USE_BFS_ORDERING else 'OFF'}")
+print(f"PageRank      : {'ON' if USE_PAGERANK else 'OFF (using degree)'}")
+print("Defined: rank_edges, order_bfs, pick_documents, fetch_documents,")
+print("         build_context, kg_retrieve, kg_answer")
