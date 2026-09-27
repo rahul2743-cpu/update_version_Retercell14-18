@@ -1,8 +1,38 @@
 # ==========================================================
 # Cell 16 : LINKING + TRAVERSAL  (SPARQL, no LLM)
+#
+#   ITERATED, NOT A PROPERTY PATH: SPARQL property paths require fixed
+#   predicate IRIs -- variables are illegal inside a path -- and the
+#   {n,m} cardinality forms were removed from SPARQL 1.1 before it was
+#   finalised. With distinct predicates per relationship, the options
+#   are a chained-statement query or an iterated 1-hop query. Iterating
+#   wins: rdflib evaluates a chained double-statement pattern as a
+#   near-cartesian join, and each hop multiplies it again.
+#
+#   OUTGOING ONLY: the walk follows ?src -> ?tgt only, like clicking
+#   forward through hyperlinks -- Doc A's hop-1 frontier is whatever
+#   A points to, hop-2 is whatever THOSE nodes point to, and so on.
+#   We no longer FILTER(?src = ?seed || ?tgt = ?seed): binding ?src
+#   straight to the frontier VALUES makes the "outgoing edges of these
+#   nodes" query directly, instead of "any edge touching these nodes"
+#   and then discarding half of it. This also means an entity or
+#   parameter seed (which Cell 10 only ever writes as an ?tgt, never
+#   an ?src) has no outgoing edges of its own and stops expanding at
+#   hop 1 -- that is intentional now, not a bug: only documents carry
+#   the walk forward, exactly like the source example in this cell's
+#   docstring.
+#
+#   SEED MATCHING: the SPARQL substring pass (CONTAINS(label, phrase))
+#   required the LABEL to contain the whole PHRASE as a substring.
+#   Extracted phrases are usually LONGER than canonical labels (they
+#   carry the question's own wording), so that direction almost never
+#   held and seed lookup silently failed. Replaced with symmetric,
+#   in-memory token-overlap scoring against LABEL_TO_NODES (Cell 14),
+#   with label tokens pre-cached once so repeated phrases don't pay
+#   for re-tokenizing the same labels over and over.
 # ==========================================================
 print("=" * 80)
-print("CELL 16 — LINKING + TRAVERSAL (outgoing-only)")
+print("CELL 16 — LINKING + TRAVERSAL")
 print("=" * 80)
 
 NEIGHBOUR_QUERY_TMPL = PREFIXES + """
@@ -43,9 +73,10 @@ def _tokens(s):
 
 def _token_score(phrase_tokens, label_tokens):
     """Recall-weighted overlap, 0-100. Full label coverage (recall=1.0)
-    is what indicates 'this label is what the phrase is about' -- extra
-    qualifier words in the phrase (lower precision) should only lightly
-    discount that, not disqualify it."""
+    means 'this label is what the phrase is about' -- extra qualifier
+    words in the phrase should only lightly discount that via
+    precision, not disqualify the match the way strict substring
+    containment did."""
     if not phrase_tokens or not label_tokens:
         return 0.0
     inter = phrase_tokens & label_tokens
@@ -61,14 +92,22 @@ def _values_block(uris):
     return " ".join(f"<{u}>" for u in uris if "<" not in u and ">" not in u)
 
 
+# ---- Pre-cache label tokens once, instead of re-tokenizing every
+#      label on every phrase inside link_entities. Pure speed-up --
+#      changes no scores, no matches. Rebuild this if LABEL_TO_NODES
+#      ever changes after this cell runs.
+_LABEL_TOKENS = {label_lc: _tokens(label_lc) for label_lc in LABEL_TO_NODES}
+
+
 def link_entities(phrases):
+    """Phrases -> [(node, label, score, phrase)]. Two passes: in-memory
+    token-overlap scoring for precision, fuzzy matching for recall."""
     best = {}
     for phrase, _cls in phrases:
         p_tok = _tokens(phrase)
-
         if p_tok:
             for label_lc, nodes in LABEL_TO_NODES.items():
-                score = _token_score(p_tok, _tokens(label_lc))
+                score = _token_score(p_tok, _LABEL_TOKENS[label_lc])
                 if score < MATCH_CUTOFF:
                     continue
                 for node in nodes:
@@ -86,32 +125,31 @@ def link_entities(phrases):
 
 
 def lexical_fallback(question, limit=5):
+    """No LLM, no embeddings. Used when extraction returns nothing or
+    nothing links."""
     q_tokens = _tokens(question)
     if not q_tokens:
         return []
     scored = []
     for label_lc, nodes in LABEL_TO_NODES.items():
-        overlap = q_tokens & _tokens(label_lc)
+        overlap = q_tokens & _LABEL_TOKENS[label_lc]
         if overlap:
-            score = 100.0 * len(overlap) / max(len(_tokens(label_lc)), 1)
+            score = 100.0 * len(overlap) / max(len(_LABEL_TOKENS[label_lc]), 1)
             for n in nodes:
                 scored.append((n, NODE_LABEL.get(n, n), min(score, 99.0), "lexical"))
     scored.sort(key=lambda x: x[2], reverse=True)
     return scored[:limit]
 
 
-def traverse(seeds, debug=False):
-    edges, seen = [], set()
-    visited = {n: (0, s, n) for n, _l, s, _p in seeds}
+def traverse(seeds):
+    """Iterated SPARQL expansion -- one query per hop, OUTGOING edges
+    only. [UNCHANGED from your pasted version]"""
+    edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
     frontier = [n for n, _l, _s, _p in seeds]
 
     for hop in range(1, MAX_HOPS + 1):
         if not frontier or len(edges) >= MAX_EDGES:
             break
-        if debug:
-            print(f"\n--- HOP {hop} ---")
-            print(f"Frontier nodes: {len(frontier)}")
-
         block = _values_block(frontier[:MAX_FRONTIER])
         if not block:
             break
@@ -121,11 +159,7 @@ def traverse(seeds, debug=False):
             print(f"  hop {hop} query failed: {e}")
             break
 
-        if debug:
-            print(f"Rows returned: {len(rows)}")
-
         next_frontier = []
-        added_this_hop = 0
         for row in rows:
             src, tgt = str(row.src), str(row.tgt)
             pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
@@ -133,8 +167,6 @@ def traverse(seeds, debug=False):
             if key in seen:
                 continue
             seen.add(key)
-
-            src_hop, src_score, src_seed_node = visited[src]
 
             edges.append({
                 "source": src,
@@ -146,24 +178,18 @@ def traverse(seeds, debug=False):
                 "strength": int(row.strength),
                 "link_type": str(row.linkType),
                 "hop": hop,
-                "seed_score": src_score,
-                "seed_node": src_seed_node,
+                "seed_score": visited.get(src, (0, 0))[1],
             })
-            added_this_hop += 1
 
             if tgt not in visited:
-                visited[tgt] = (hop, src_score, src_seed_node)
+                visited[tgt] = (hop, edges[-1]["seed_score"])
                 next_frontier.append(tgt)
 
             if len(edges) >= MAX_EDGES:
                 break
         frontier = next_frontier
 
-        if debug:
-            print(f"Edges added: {added_this_hop}")
-            print(f"Next frontier: {len(frontier)}")
-
     return edges, visited
 
 
-print("Defined: link_entities, lexical_fallback, traverse (outgoing-only, with seed provenance)")
+print("Defined: link_entities, lexical_fallback, traverse")
