@@ -20,6 +20,17 @@
 #   On the next iteration it is bound as ?src, allowing us to follow
 #   its outgoing edges. If it has no outgoing statements, it naturally
 #   stops expanding.
+#
+#   SEED MATCHING (this cell's fix): the old precision pass used
+#   SPARQL CONTAINS(label, phrase) -- i.e. the LABEL had to contain
+#   the whole PHRASE as a substring. Extracted phrases are usually
+#   LONGER than canonical labels (they carry the question's own
+#   wording -- e.g. "actual engine oil consumption" vs. the label
+#   "Engine Oil Consumption"), so that containment direction almost
+#   never holds and seed lookup silently fails. Replaced with a
+#   symmetric token-overlap (F1) score against Cell 14's own label
+#   index -- no SPARQL round-trip, no word lists, nothing
+#   content-specific, and it doesn't care which side is longer.
 # ==========================================================
 print("=" * 80)
 print("CELL 16 — LINKING + TRAVERSAL (outgoing-only)")
@@ -52,16 +63,6 @@ WHERE {
 }
 """
 
-SUBSTRING_TMPL = PREFIXES + """
-SELECT DISTINCT ?node ?label
-WHERE {
-    ?node rdfs:label ?label .
-    FILTER(CONTAINS(LCASE(STR(?label)), %PHRASE%))
-    FILTER(!STRSTARTS(STR(?node), "%PREDMARK%"))
-}
-LIMIT 10
-"""
-
 _STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
          "are", "what", "which", "how", "does", "do", "with", "by", "from"}
 
@@ -71,29 +72,47 @@ def _tokens(s):
             if t not in _STOP and len(t) > 2}
 
 
+def _token_f1(phrase_tokens, label_tokens):
+    """Symmetric overlap score, 0-100. Unlike CONTAINS, direction
+    doesn't matter: recall (how much of the LABEL the phrase covers)
+    and precision (how much of the PHRASE the label covers) are both
+    measured, so a phrase with extra qualifier words still scores
+    well as long as it fully covers the label -- recall stays 1.0,
+    only precision softens the score."""
+    if not phrase_tokens or not label_tokens:
+        return 0.0
+    inter = phrase_tokens & label_tokens
+    if not inter:
+        return 0.0
+    recall = len(inter) / len(label_tokens)
+    precision = len(inter) / len(phrase_tokens)
+    return 100.0 * (2 * recall * precision / (recall + precision))
+
+
 def _values_block(uris):
     return " ".join(f"<{u}>" for u in uris if "<" not in u and ">" not in u)
 
 
-def _sparql_literal(s):
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
 def link_entities(phrases):
-    """Phrases -> [(node, label, score, phrase)]. Two passes: SPARQL
-    substring for precision, fuzzy for recall."""
+    """Phrases -> [(node, label, score, phrase)]. Two passes, both
+    non-directional so extra/missing words in the extracted phrase
+    don't silently kill the match:
+      1. token-overlap (F1), against Cell 14's LABEL_TO_NODES index
+      2. character fuzzy (fuzzy_match), for typos / rewordings that
+         token overlap alone would miss
+    """
     best = {}
     for phrase, _cls in phrases:
-        q = (SUBSTRING_TMPL
-             .replace("%PHRASE%", _sparql_literal(phrase.lower()))
-             .replace("%PREDMARK%", PREDICATE_MARKER))
-        try:
-            for row in g.query(q):
-                node = str(row.node)
-                if best.get(node, (0,))[0] < 95:
-                    best[node] = (95.0, phrase)
-        except Exception as e:
-            print(f"  substring query failed for {phrase!r}: {e}")
+        p_tok = _tokens(phrase)
+
+        if p_tok:
+            for label_lc, nodes in LABEL_TO_NODES.items():
+                score = _token_f1(p_tok, _tokens(label_lc))
+                if score < MATCH_CUTOFF:
+                    continue
+                for node in nodes:
+                    if best.get(node, (0,))[0] < score:
+                        best[node] = (score, phrase)
 
         for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
                                            MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
