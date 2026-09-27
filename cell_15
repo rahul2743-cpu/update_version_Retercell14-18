@@ -12,13 +12,6 @@ print("=" * 80)
 print("CELL 15 — QUERY ENTITY EXTRACTION")
 print("=" * 80)
 
-# ---- Config ---------------------------------------------------------------
-MAX_ENTITY_PHRASES = 8             # hard cap -- keeps Cell 16 from fanning out
-                                    # into dozens of SPARQL/fuzzy lookups on a
-                                    # single question
-EXTRACT_MAX_RETRIES = 2            # transient LLM/network hiccups only --
-                                    # a bad/unparseable response is NOT retried
-
 EXTRACT_PROMPT = """You extract entity mentions from a question so they can be
 looked up in a systems-engineering knowledge graph.
 
@@ -29,34 +22,11 @@ or failure mode. Use the exact phrase as it appears in the question.
 Do NOT return: question words, verbs, generic words like "process" or
 "information", or anything you invent that is not in the question.
 
-Output ONE noun phrase per line, exact wording from the question.
-No preamble, no markdown, no numbering, no class labels -- just the
-phrase itself, one per line.
+Output one record per entity, formatted exactly as:
+<entity phrase>|<one of: System, Component, ControlFactor, NoiseFactor, ErrorState, Method, Procedure, Standard, Concept>
+
+No preamble, no markdown, no numbering. Only the records.
 If the question names no concrete entity at all, output exactly: NONE"""
-
-
-def _clean_phrase(phrase: str) -> str:
-    """Strips wrapping quotes/backticks/whitespace an LLM sometimes adds
-    around a phrase, e.g. '"OpenTCCM"' -> 'OpenTCCM'."""
-    return phrase.strip().strip("\"'`").strip()
-
-
-def _parse_entities(text: str):
-    """Turns the LLM's raw one-phrase-per-line output into a deduped
-    list of phrases, preserving first-seen order."""
-    out, seen = [], set()
-    for line in text.splitlines():
-        phrase = _clean_phrase(line.strip().lstrip("-*0123456789. ").strip())
-        if not phrase:
-            continue
-        key = phrase.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(phrase)
-        if len(out) >= MAX_ENTITY_PHRASES:
-            break
-    return out
 
 
 def extract_query_entities(question: str):
@@ -65,46 +35,48 @@ def extract_query_entities(question: str):
 
     Args:
        question (str): The user's natural-language question.
-    Returns:
-       list[str]: exact noun phrases from the question, deduped
-       (case-insensitive), in first-seen order, capped at
-       MAX_ENTITY_PHRASES.
+    Return:
+       list[tuple[str, str]]: List of (phrase, class_hint) tuples.
+       -phrase: exact noun phrase from the question
+       -class_hint: entity type (System, Component, etc.)
 
     Behaviour:
-      - Never raises; LLM failures degrade gracefully to []
-      - Retries up to EXTRACT_MAX_RETRIES times on transient call
-        failures (timeouts, connection errors) -- a response that
-        comes back but fails to parse is NOT retried, since retrying
-        won't fix a malformed answer
-      - If the LLM returns "NONE", returns [] (no entities found)
-      - The caller (Cell 16) falls back to lexical matching when []
-        is returned
+      -Never raises exceptions; LLM failures degrade gracefully to []
+      -If LLM returns "NONE", returns [] (no entities found)
+      -The caller (Cell 16) falls back to lexical matching when [] is returned
+
+    Deliberately left as free-form extraction: phrases may retain
+    qualifier words from the question (e.g. "actual engine oil
+    consumption" instead of "engine oil consumption"). This is by
+    design, not a bug -- stripping qualifiers here would require a
+    hardcoded word list that can never cover every future phrasing.
+    Cell 16's link_entities() instead uses symmetric token-overlap
+    (F1) scoring against the graph's own label index, so extra or
+    missing qualifier words in the phrase don't break the match.
+    Robustness belongs in the deterministic matching layer, not in
+    this LLM-driven extraction step.
     """
-    text = None
-    last_err = None
-
-    for attempt in range(EXTRACT_MAX_RETRIES + 1):
-        try:
-            resp = driver_llm.invoke([
-                {"role": "system", "content": EXTRACT_PROMPT},
-                {"role": "user", "content": question},
-            ])
-            text = resp.content.strip()
-            break
-        except Exception as e:
-            last_err = e
-            continue
-
-    if text is None:
-        print(f"  entity extraction failed after {EXTRACT_MAX_RETRIES + 1} "
-              f"attempt(s) ({last_err}) -- lexical fallback")
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": question},
+        ])
+        text = resp.content.strip()
+    except Exception as e:
+        print(f"  entity extraction failed ({e}) -- lexical fallback")
         return []
 
     if text.upper().startswith("NONE"):
         return []
 
-    return _parse_entities(text)
+    out = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*0123456789. ").strip()
+        if line and "|" in line:
+            phrase, cls = line.split("|", 1)
+            if phrase.strip():
+                out.append((phrase.strip(), cls.strip()))
+    return out
 
 
 print("Defined: extract_query_entities(question)")
-print(f"Max phrases/query : {MAX_ENTITY_PHRASES}")
