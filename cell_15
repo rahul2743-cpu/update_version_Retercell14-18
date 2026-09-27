@@ -17,7 +17,31 @@ looked up in a systems-engineering knowledge graph.
 
 Return every noun phrase in the question that names a concrete thing:
 a system, component, parameter, method, procedure, standard, document,
-or failure mode. Use the exact phrase as it appears in the question.
+or failure mode.
+
+When an extracted phrase contains a longer descriptive phrase around
+a core technical concept, identify the shortest meaningful technical
+core as the PRIMARY candidate.
+
+The primary candidate should represent the underlying technical
+concept, measurement, component, condition, method, or relationship,
+while removing words that only describe its magnitude, state,
+context, ownership, or other incidental details in the question.
+
+If a more specific version of the phrase is also a meaningful
+technical entity, return it as a SECONDARY candidate after the
+primary candidate.
+
+Examples:
+- "actual engine oil consumption" -> "oil consumption" first,
+  optionally "engine oil consumption" second.
+- "maximum allowable engine temperature" -> "engine temperature"
+  first, optionally "maximum allowable engine temperature" second.
+- "high aircraft hydraulic pressure" -> "hydraulic pressure" first,
+  optionally "aircraft hydraulic pressure" second.
+
+Do not use these examples as fixed vocabulary. Apply the same
+principle generically to any question.
 
 Do NOT return: question words, verbs, generic words like "process" or
 "information", or anything you invent that is not in the question.
@@ -36,25 +60,23 @@ def extract_query_entities(question: str):
     Args:
        question (str): The user's natural-language question.
     Return:
-       list[tuple[str, str]]: List of (phrase, class_hint) tuples.
-       -phrase: exact noun phrase from the question
+       list[tuple[str, str]]: List of (phrase, class_hint) tuples,
+       PRIMARY (core concept) candidates listed before SECONDARY
+       (more specific) candidates for the same entity, per
+       EXTRACT_PROMPT.
+       -phrase: a candidate entity name derived from the question
        -class_hint: entity type (System, Component, etc.)
 
     Behaviour:
       -Never raises exceptions; LLM failures degrade gracefully to []
       -If LLM returns "NONE", returns [] (no entities found)
       -The caller (Cell 16) falls back to lexical matching when [] is returned
-
-    Deliberately left as free-form extraction: phrases may retain
-    qualifier words from the question (e.g. "actual engine oil
-    consumption" instead of "engine oil consumption"). This is by
-    design, not a bug -- stripping qualifiers here would require a
-    hardcoded word list that can never cover every future phrasing.
-    Cell 16's link_entities() instead uses symmetric token-overlap
-    (F1) scoring against the graph's own label index, so extra or
-    missing qualifier words in the phrase don't break the match.
-    Robustness belongs in the deterministic matching layer, not in
-    this LLM-driven extraction step.
+      -May return both a core-concept phrase and a more specific
+       variant for the same entity; Cell 16's link_entities() scores
+       every candidate independently via recall-weighted token
+       overlap, so whichever phrase actually matches a graph label
+       wins -- extraction doesn't need to guess exactly right, it
+       just needs to offer good candidates.
     """
     try:
         resp = driver_llm.invoke([
@@ -70,12 +92,17 @@ def extract_query_entities(question: str):
         return []
 
     out = []
+    seen = set()
     for line in text.splitlines():
         line = line.strip().lstrip("-*0123456789. ").strip()
         if line and "|" in line:
             phrase, cls = line.split("|", 1)
-            if phrase.strip():
-                out.append((phrase.strip(), cls.strip()))
+            phrase = phrase.strip()
+            cls = cls.strip()
+            key = (phrase.lower(), cls.lower())
+            if phrase and key not in seen:
+                seen.add(key)
+                out.append((phrase, cls))
     return out
 
 
