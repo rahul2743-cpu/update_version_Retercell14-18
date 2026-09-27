@@ -9,30 +9,20 @@
 #   wins: rdflib evaluates a chained double-statement pattern as a
 #   near-cartesian join, and each hop multiplies it again.
 #
-#   OUTGOING ONLY: the walk follows ?src -> ?tgt only, like clicking
-#   forward through hyperlinks -- Doc A's hop-1 frontier is whatever
-#   A points to, hop-2 is whatever THOSE nodes point to, and so on.
-#   VALUES binds ?src straight to the frontier, so the query IS
-#   "outgoing edges of these nodes" -- not "any edge touching these
-#   nodes" with half the result thrown away. An entity/parameter seed
-#   (Cell 10 only ever writes those as ?tgt, never ?src) has no
-#   outgoing edges and stops at hop 1 -- intentional, not a bug.
+#   OUTGOING ONLY: Cell 10 writes document -> entity edges as directed
+#   links, and the desired traversal semantics are "what does this
+#   node point to" (like following outbound Wikipedia links), not
+#   "what points to this node". So VALUES binds directly onto ?src --
+#   never onto ?tgt -- meaning a node only ever expands via its own
+#   outgoing statements.
 #
-#   DEAD-END DIAGNOSTIC: after every traversal run, it's useful to
-#   know WHICH reached nodes had nothing to walk out of them, and
-#   WHY -- without ever naming a single title. diagnose_dead_ends()
-#   answers that generically, straight from the graph + raw_df:
-#     - already a document (in CONTENT_NODES)      -> genuinely has
-#       no outgoing links, not a gap.
-#     - resolves to a real page in raw_df, but was
-#       never loaded as a source                    -> closure gap,
-#       Cell 5b should have pulled it in (bump CLOSURE_HOPS /
-#       MAX_CLOSURE_DOCS, or re-run Cell 5b -- xml_df may be stale).
-#     - no matching page in raw_df at all            -> just a link
-#       label / mention; there is no page to load.
+#   A node reached as ?tgt becomes the frontier for the next hop.
+#   On the next iteration it is bound as ?src, allowing us to follow
+#   its outgoing edges. If it has no outgoing statements, it naturally
+#   stops expanding.
 # ==========================================================
 print("=" * 80)
-print("CELL 16 — LINKING + TRAVERSAL")
+print("CELL 16 — LINKING + TRAVERSAL (outgoing-only)")
 print("=" * 80)
 
 NEIGHBOUR_QUERY_TMPL = PREFIXES + """
@@ -70,22 +60,6 @@ WHERE {
     FILTER(!STRSTARTS(STR(?node), "%PREDMARK%"))
 }
 LIMIT 10
-"""
-
-# Every reified statement whose SUBJECT is a dead end -- i.e. that
-# subject never shows up as an ?object anywhere either as a document
-# that was actually processed. Used only by diagnose_dead_ends() below;
-# kept as a template (not inline) for the same reason the others are.
-DEAD_END_QUERY = PREFIXES + """
-SELECT DISTINCT ?node ?label ?targetRef
-WHERE {
-    ?stmt a rdf:Statement ; rdf:object ?node .
-    OPTIONAL { ?node rdfs:label ?label }
-    OPTIONAL { ?node ex:targetReference ?targetRef }
-    FILTER NOT EXISTS {
-        ?stmt2 a rdf:Statement ; rdf:subject ?node .
-    }
-}
 """
 
 _STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
@@ -148,21 +122,31 @@ def lexical_fallback(question, limit=5):
     return scored[:limit]
 
 
-def traverse(seeds):
-    """Iterated SPARQL expansion -- one query per hop, OUTGOING edges
-    only. The frontier passed into hop N+1 is exactly the set of ?tgt
-    nodes newly reached at hop N (never the ?src side, which is already
-    a seed or already visited by construction). This grows a directed
-    subgraph -- seed -> hop1 targets -> hop2 targets -> ... -- the same
-    way you'd fan out across Wikipedia by only clicking outgoing links,
-    rather than an undirected ball that also pulls in everything that
-    happens to link TO a node."""
-    edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
+def traverse(seeds, debug=False):
+    """Iterated SPARQL expansion -- one query per hop, VALUES rebound to
+    that hop's frontier. OUTGOING ONLY: the frontier binds to ?src, so
+    each hop only follows src -> tgt edges forward.
+
+    `visited` stores (hop, seed_score, seed_node) per node, so every
+    reached node -- and every edge built from it -- can be traced back
+    to the seed that produced it. Known limitation: if two different
+    seeds both reach the same downstream node, only the first one seen
+    (in query result order) sets that node's provenance; switch to
+    storing a list of (hop, score, seed_node) per node if you later
+    need multi-seed provenance.
+    """
+    edges, seen = [], set()
+    visited = {n: (0, s, n) for n, _l, s, _p in seeds}
     frontier = [n for n, _l, _s, _p in seeds]
 
     for hop in range(1, MAX_HOPS + 1):
         if not frontier or len(edges) >= MAX_EDGES:
             break
+
+        if debug:
+            print(f"\n--- HOP {hop} ---")
+            print(f"Frontier nodes: {len(frontier)}")
+
         block = _values_block(frontier[:MAX_FRONTIER])
         if not block:
             break
@@ -172,7 +156,11 @@ def traverse(seeds):
             print(f"  hop {hop} query failed: {e}")
             break
 
+        if debug:
+            print(f"Rows returned: {len(rows)}")
+
         next_frontier = []
+        added_this_hop = 0
         for row in rows:
             src, tgt = str(row.src), str(row.tgt)
             pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
@@ -180,6 +168,14 @@ def traverse(seeds):
             if key in seen:
                 continue
             seen.add(key)
+
+            # `src` must already be in `visited`: the current frontier is
+            # constructed only from previously discovered nodes (seeds, or
+            # earlier hops' tgt values), and every node is written into
+            # `visited` at the same moment it's added to `next_frontier`.
+            # A KeyError here would mean that invariant broke -- fail loudly
+            # rather than silently falling back to seed_score=0.
+            src_hop, src_score, src_seed_node = visited[src]
 
             edges.append({
                 "source": src,
@@ -191,92 +187,27 @@ def traverse(seeds):
                 "strength": int(row.strength),
                 "link_type": str(row.linkType),
                 "hop": hop,
-                # src is always already visited (seed or a prior hop's target),
-                # so its seed_score is the only side that can carry provenance
-                "seed_score": visited.get(src, (0, 0))[1],
+                "seed_score": src_score,
+                "seed_node": src_seed_node,
             })
+            added_this_hop += 1
 
-            # outgoing-only: only ?tgt is a newly discovered node.
+            # OUTGOING ONLY: src is already in `visited` (it was the
+            # frontier we just queried). Only tgt is new, and only tgt
+            # advances to the next hop's frontier.
             if tgt not in visited:
-                visited[tgt] = (hop, edges[-1]["seed_score"])
+                visited[tgt] = (hop, src_score, src_seed_node)
                 next_frontier.append(tgt)
 
             if len(edges) >= MAX_EDGES:
                 break
         frontier = next_frontier
 
+        if debug:
+            print(f"Edges added: {added_this_hop}")
+            print(f"Next frontier: {len(frontier)}")
+
     return edges, visited
 
 
-# ----------------------------------------------------------
-# Dead-end diagnostic -- fully generic, no title list anywhere.
-# Reads the actual graph + raw_df to classify EVERY node the graph
-# ever reaches as a target but never expands from.
-# ----------------------------------------------------------
-
-def _normalize_ref(s):
-    """Same two rules as Cell 6 / Cell 8a / Cell 5b's normalize_ref_col,
-    just in plain Python -- so a reference resolves here exactly the
-    way it resolves everywhere else in the pipeline."""
-    s = (s or "").strip()
-    s = re.sub(r"^xwiki:", "", s)
-    s = re.sub(r"\s+", "", s)
-    return s
-
-
-def diagnose_dead_ends(verbose=True):
-    """Finds every node in `g` that is reached as an ?object of some
-    reified statement but never appears as an ?object's rdf:subject --
-    i.e. a node the outgoing-only traverse() can never expand past --
-    and classifies each one into exactly one of three buckets using
-    only data already in the pipeline (CONTENT_NODES from Cell 14,
-    raw_df from Cell 4). Returns the three lists; nothing here is
-    hardcoded to any specific title or document."""
-    dead_ends = []
-    for row in g.query(DEAD_END_QUERY):
-        node = str(row.node)
-        dead_ends.append({
-            "node": node,
-            "label": str(row.label) if row.label else NODE_LABEL.get(node, node),
-            "target_reference": str(row.targetRef) if row.targetRef else None,
-            "already_a_document": node in CONTENT_NODES,
-        })
-
-    ref_to_source = {
-        _normalize_ref(r["reference"]): r["source"]
-        for r in raw_df.select("reference", "source").distinct().collect()
-    }
-
-    genuine, closure_gap, no_page = [], [], []
-    for d in dead_ends:
-        if d["already_a_document"]:
-            genuine.append(d)
-            continue
-        src = (ref_to_source.get(_normalize_ref(d["target_reference"]))
-               if d["target_reference"] else None)
-        (closure_gap if src else no_page).append({**d, "resolved_source": src})
-
-    if verbose:
-        print()
-        print("-" * 80)
-        print("DEAD-END DIAGNOSTIC")
-        print("-" * 80)
-        print(f"Dead-end nodes found in graph                   : {len(dead_ends)}")
-        print(f"  already processed, genuinely no outgoing links : {len(genuine)}")
-        print(f"  real page in raw_df, never loaded as a source  : {len(closure_gap)}  <- closure gap")
-        print(f"  no matching page in raw_df at all               : {len(no_page)}")
-        if closure_gap:
-            print()
-            print("Closure gaps (real pages Cell 5b should have pulled in):")
-            display(spark.createDataFrame(closure_gap).select(
-                "label", "target_reference", "resolved_source"))
-
-    return genuine, closure_gap, no_page
-
-
-print("Defined: link_entities, lexical_fallback, traverse, diagnose_dead_ends")
-
-# Run once at cell-execution time so the diagnostic is always current
-# for whatever graph `g` holds right now -- not something you have to
-# remember to call separately after building/rebuilding the KG.
-_genuine, _closure_gap, _no_page = diagnose_dead_ends()
+print("Defined: link_entities, lexical_fallback, traverse (outgoing-only, with seed provenance)")
